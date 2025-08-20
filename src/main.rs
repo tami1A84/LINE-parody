@@ -1,101 +1,89 @@
-mod ui;
+mod cache_db;
+mod emoji_loader;
+mod nip49;
 mod nostr_client;
+mod ui;
+mod types;
 
 use eframe::egui;
-use nostr::{Keys, PublicKey};
-use nostr_sdk::Client;
-
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
+use std::fs;
+use nostr::PublicKey;
+use regex::Regex;
 
-// NIP-49 (ChaCha20Poly1305) のための暗号クレート
+mod theme;
 
-// PBKDF2のためのクレート
+use crate::cache_db::{LmdbCache, DB_FOLLOWED, DB_PROFILES, DB_RELAYS};
+use crate::types::*;
 
-// serde と serde_json を使って設定ファイルとNIP-01メタデータを構造体として定義
-use serde::{Serialize, Deserialize};
-
-use self::nostr_client::{connect_to_relays_with_nip65, fetch_nip01_profile, fetch_relays_for_followed_users};
 
 const CONFIG_FILE: &str = "config.json"; // 設定ファイル名
+
+const DB_PATH: &str = "cache_db";
+const CACHE_DIR: &str = "cache"; // Re-added for migration
+
 const MAX_STATUS_LENGTH: usize = 140; // ステータス最大文字数
 
-#[derive(Serialize, Deserialize)]
-pub struct Config {
-    encrypted_secret_key: String, // NIP-49フォーマットの暗号化された秘密鍵
-    salt: String, // PBKDF2に使用するソルト (Base64エンコード)
-}
+async fn migrate_data_from_files(
+    cache_db: &LmdbCache,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let cache_path = Path::new(CACHE_DIR);
+    if !cache_path.exists() {
+        return Ok(());
+    }
 
-// NIP-01 プロファイルメタデータのための構造体
-// フィールドはNIP-01の推奨に従う
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct ProfileMetadata {
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub about: String,
-    #[serde(default)]
-    pub picture: String,
-    #[serde(default)]
-    pub nip05: String, // NIP-05 identifier
-    #[serde(default)]
-    pub lud16: String, // Lightning Address
-    #[serde(flatten)] // その他の不明なフィールドを保持
-    pub extra: std::collections::HashMap<String, serde_json::Value>,
-}
+    println!("Old cache directory found. Starting data migration...");
 
-// リレーリスト編集のための構造体
-#[derive(Debug, Clone, Default)]
-pub struct EditableRelay {
-    pub url: String,
-    pub read: bool,
-    pub write: bool,
-}
+    let mut files_by_pubkey: HashMap<String, Vec<std::path::PathBuf>> = HashMap::new();
+    let re = Regex::new(r"([a-f0-9]{64})_.*\.json")?;
 
+    for entry in fs::read_dir(cache_path)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() {
+            if let Some(captures) = re.captures(path.file_name().unwrap().to_str().unwrap()) {
+                if let Some(pubkey) = captures.get(1) {
+                    files_by_pubkey
+                        .entry(pubkey.as_str().to_string())
+                        .or_default()
+                        .push(path);
+                }
+            }
+        }
+    }
 
-// タイムラインの各投稿を表すための構造体
-#[derive(Debug, Clone)]
-pub struct TimelinePost {
-    pub author_pubkey: PublicKey,
-    pub author_metadata: ProfileMetadata,
-    pub content: String,
-    pub created_at: nostr::Timestamp,
-}
+    for (pubkey_hex, paths) in files_by_pubkey {
+        println!("Migrating data for pubkey: {}", pubkey_hex);
+        for path in paths {
+            let file_name = path.file_name().unwrap().to_str().unwrap();
+            if file_name.ends_with("_followed.json") {
+                let content = fs::read_to_string(&path)?;
+                let cache: Cache<HashSet<PublicKey>> = serde_json::from_str(&content)?;
+                cache_db.write_cache(DB_FOLLOWED, &pubkey_hex, &cache.data)?;
+                println!("  - Migrated followed list.");
+            } else if file_name.ends_with("_nip65.json") {
+                let content = fs::read_to_string(&path)?;
+                let cache: Cache<Vec<(String, Option<String>)>> = serde_json::from_str(&content)?;
+                cache_db.write_cache(DB_RELAYS, &pubkey_hex, &cache.data)?;
+                println!("  - Migrated NIP-65 relays.");
+            } else if file_name.ends_with("_profile.json") {
+                let content = fs::read_to_string(&path)?;
+                let cache: Cache<ProfileMetadata> = serde_json::from_str(&content)?;
+                cache_db.write_cache(DB_PROFILES, &pubkey_hex, &cache.data)?;
+                println!("  - Migrated profile metadata.");
+            }
+        }
+    }
 
-// アプリケーションの内部状態を保持する構造体
-pub struct NostrStatusAppInternal {
-    pub is_logged_in: bool,
-    pub status_message_input: String, // ユーザーが入力するステータス
-    pub show_post_dialog: bool, // 投稿ダイアログの表示状態
-    pub secret_key_input: String, // 初回起動時の秘密鍵入力用
-    pub passphrase_input: String,
-    pub confirm_passphrase_input: String,
-    pub nostr_client: Option<Client>,
-    pub my_keys: Option<Keys>,
-    pub followed_pubkeys: HashSet<PublicKey>, // NIP-02で取得したフォローリスト
-    pub followed_pubkeys_display: String, // GUI表示用の文字列
-    pub timeline_posts: Vec<TimelinePost>, // GUI表示用のステータスタイムライン
-    pub should_repaint: bool, // UIの再描画をトリガーするためのフラグ
-    pub is_loading: bool, // 処理中であることを示すフラグ
-    pub current_tab: AppTab, // 現在選択されているタブ
-    pub connected_relays_display: String, // 接続中のリレー表示用
-    pub nip01_profile_display: String, // GUI表示用のNIP-01プロファイルJSON文字列
-    pub editable_profile: ProfileMetadata, // 編集可能なNIP-01プロファイルデータ
-    pub profile_fetch_status: String, // プロファイル取得状態メッセージ
-    // リレーリスト編集用のフィールド
-    pub nip65_relays: Vec<EditableRelay>,
-    pub discover_relays_editor: String,
-    pub default_relays_editor: String,
-}
+    // Rename the old cache directory to prevent re-migration
+    let migrated_path = Path::new("cache_migrated");
+    fs::rename(cache_path, migrated_path)?;
+    println!("Data migration complete. Old cache directory renamed to 'cache_migrated'.");
 
-// タブの状態を管理するenum
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
-pub enum AppTab {
-    Home, // ログイン/登録画面とタイムラインを含む
-    Relays,
-    Profile,
+    Ok(())
 }
 
 // eframe::Appトレイトを実装する構造体
@@ -111,27 +99,22 @@ impl NostrStatusApp {
         // egui のスタイル設定
         _cc.egui_ctx.set_pixels_per_point(1.2); // UIのスケールを調整
         let mut style = (*_cc.egui_ctx.style()).clone();
-        
+
         // --- フォント設定 ---
         let mut fonts = egui::FontDefinitions::default();
 
-        // **LINE Seed JPを読み込む**
-        // `LINESeedJP_TTF_Rg.ttf` はダウンロードしたフォントファイル名に合わせてください。
-        // 例えば `LINESeedJP_TTF_Bd.ttf` (Bold) など、他のウェイトも追加できます。
         fonts.font_data.insert(
             "LINESeedJP".to_owned(),
-            egui::FontData::from_static(include_bytes!("../assets/fonts/LINESeedJP_TTF_Rg.ttf")).into(),
+            egui::FontData::from_static(include_bytes!("../assets/fonts/LINESeedJP_TTF_Rg.ttf"))
+                .into(),
         );
 
-        // **Proportional（可変幅）フォントファミリーにLINESeedJPを最優先で追加**
         fonts
             .families
             .entry(egui::FontFamily::Proportional)
             .or_default()
             .insert(0, "LINESeedJP".to_owned());
 
-        // **Monospace（等幅）フォントファミリーにもLINESeedJPを追加**
-        // 必要に応じて、コーディングフォントなど別の等幅フォントを優先することも可能です。
         fonts
             .families
             .entry(egui::FontFamily::Monospace)
@@ -140,80 +123,64 @@ impl NostrStatusApp {
 
         _cc.egui_ctx.set_fonts(fonts);
 
-        // --- モダンなmacOS風デザインのためのスタイル調整 ---
-        style.visuals = egui::Visuals::light(); // ライトモードを基準にする
+        // --- スタイル調整 ---
+        style.visuals = theme::light_visuals(); // ライトモードを基準にする
 
-        // カラーパレット
-        let background_color = egui::Color32::from_rgb(242, 242, 247); // macOSのウィンドウ背景色に近い
-        let panel_color = egui::Color32::from_rgb(255, 255, 255); // パネルは白
-        let text_color = egui::Color32::BLACK;
-        let accent_color = egui::Color32::from_rgb(0, 110, 230); // 少し落ち着いた青
-        let separator_color = egui::Color32::from_gray(225);
-
-        // 全体的なビジュアル設定
-        style.visuals.window_fill = background_color;
-        style.visuals.panel_fill = panel_color; // 中央パネルなどの背景色
-        style.visuals.override_text_color = Some(text_color);
-        style.visuals.hyperlink_color = accent_color;
-        style.visuals.faint_bg_color = background_color; // ボタンなどの背景に使われる
-        style.visuals.extreme_bg_color = egui::Color32::from_gray(230); // テキスト編集フィールドなどの背景
-
-        // ウィジェットのスタイル
-        let widget_visuals = &mut style.visuals.widgets;
-
-        // 角丸の設定
+        // 角丸やテキストスタイルは共通で設定
         let corner_radius = 6.0;
-        widget_visuals.noninteractive.corner_radius = corner_radius.into();
-        widget_visuals.inactive.corner_radius = corner_radius.into();
-        widget_visuals.hovered.corner_radius = corner_radius.into();
-        widget_visuals.active.corner_radius = corner_radius.into();
-        widget_visuals.open.corner_radius = corner_radius.into();
+        style.visuals.widgets.noninteractive.corner_radius = corner_radius.into();
+        style.visuals.widgets.inactive.corner_radius = corner_radius.into();
+        style.visuals.widgets.hovered.corner_radius = corner_radius.into();
+        style.visuals.widgets.active.corner_radius = corner_radius.into();
+        style.visuals.widgets.open.corner_radius = corner_radius.into();
 
-        // 非インタラクティブなウィジェット（ラベルなど）
-        widget_visuals.noninteractive.bg_fill = egui::Color32::TRANSPARENT; // 背景なし
-        widget_visuals.noninteractive.bg_stroke = egui::Stroke::NONE; // 枠線なし
-        widget_visuals.noninteractive.fg_stroke = egui::Stroke::new(1.0, text_color); // テキストの色
-
-        // 非アクティブなウィジェット（ボタンなど）
-        widget_visuals.inactive.bg_fill = egui::Color32::from_gray(235);
-        widget_visuals.inactive.bg_stroke = egui::Stroke::NONE;
-        widget_visuals.inactive.fg_stroke = egui::Stroke::new(1.0, text_color);
-
-        // ホバー時のウィジェット
-        widget_visuals.hovered.bg_fill = egui::Color32::from_gray(220);
-        widget_visuals.hovered.bg_stroke = egui::Stroke::NONE;
-        widget_visuals.hovered.fg_stroke = egui::Stroke::new(1.0, text_color);
-
-        // アクティブなウィジェット（クリック中）
-        widget_visuals.active.bg_fill = egui::Color32::from_gray(210);
-        widget_visuals.active.bg_stroke = egui::Stroke::NONE;
-        widget_visuals.active.fg_stroke = egui::Stroke::new(1.0, accent_color);
-
-        // テキスト選択
-        style.visuals.selection.bg_fill = accent_color.linear_multiply(0.3); // 少し薄いアクセントカラー
-        style.visuals.selection.stroke = egui::Stroke::new(1.0, text_color);
-
-        // ウィンドウとパネルのストローク
-        style.visuals.window_stroke = egui::Stroke::new(1.0, separator_color);
-
-        // テキストスタイル
         style.text_styles = [
-            (egui::TextStyle::Heading, egui::FontId::new(20.0, egui::FontFamily::Proportional)),
-            (egui::TextStyle::Body, egui::FontId::new(13.0, egui::FontFamily::Proportional)),
-            (egui::TextStyle::Monospace, egui::FontId::new(12.0, egui::FontFamily::Monospace)),
-            (egui::TextStyle::Button, egui::FontId::new(13.0, egui::FontFamily::Proportional)),
-            (egui::TextStyle::Small, egui::FontId::new(11.0, egui::FontFamily::Proportional)),
-        ].into();
+            (
+                egui::TextStyle::Heading,
+                egui::FontId::new(20.0, egui::FontFamily::Proportional),
+            ),
+            (
+                egui::TextStyle::Body,
+                egui::FontId::new(13.0, egui::FontFamily::Proportional),
+            ),
+            (
+                egui::TextStyle::Monospace,
+                egui::FontId::new(12.0, egui::FontFamily::Monospace),
+            ),
+            (
+                egui::TextStyle::Button,
+                egui::FontId::new(13.0, egui::FontFamily::Proportional),
+            ),
+            (
+                egui::TextStyle::Small,
+                egui::FontId::new(11.0, egui::FontFamily::Proportional),
+            ),
+        ]
+        .into();
 
         _cc.egui_ctx.set_style(style);
 
+        let lmdb_cache =
+            LmdbCache::new(Path::new(DB_PATH)).expect("Failed to initialize LMDB cache");
+
         let app_data_internal = NostrStatusAppInternal {
+            nwc_uri_input: String::new(),
+            cache_db: lmdb_cache,
             is_logged_in: false,
             status_message_input: String::new(),
             show_post_dialog: false,
+            show_emoji_picker: false,
+            my_emojis: HashMap::new(),
             secret_key_input: String::new(),
             passphrase_input: String::new(),
             confirm_passphrase_input: String::new(),
+    current_status_type: StatusType::General,
+    show_music_dialog: false,
+    music_track_input: String::new(),
+    music_url_input: String::new(),
+    show_podcast_dialog: false,
+    podcast_episode_input: String::new(),
+    podcast_url_input: String::new(),
             nostr_client: None,
             my_keys: None,
             followed_pubkeys: HashSet::new(),
@@ -225,33 +192,55 @@ impl NostrStatusApp {
             connected_relays_display: String::new(),
             nip01_profile_display: String::new(), // ここを初期化
             editable_profile: ProfileMetadata::default(), // 編集可能なプロファイルデータ
-            profile_fetch_status: "Fetching NIP-01 profile...".to_string(), // プロファイル取得状態
+            profile_fetch_status: "Fetching profile...".to_string(), // プロファイル取得状態
             // リレーリスト編集用のフィールドを初期化
             nip65_relays: Vec::new(),
             discover_relays_editor: "wss://purplepag.es\nwss://directory.yabu.me".to_string(),
-            default_relays_editor: "wss://relay.damus.io\nwss://relay.nostr.wirednet.jp\nwss://yabu.me".to_string(),
+            default_relays_editor:
+                "wss://relay.damus.io\nwss://relay.nostr.wirednet.jp\nwss://yabu.me".to_string(),
+            current_theme: AppTheme::Light,
+            image_cache: HashMap::new(),
+            nwc_passphrase_input: String::new(),
+            nwc: None,
+            nwc_client: None,
+            nwc_error: None,
+            zap_history: Vec::new(),
+            zap_history_fetch_status: String::new(),
+            is_fetching_zap_history: false,
+            show_zap_dialog: false,
+            zap_amount_input: String::new(),
+            zap_target_post: None,
         };
         let data = Arc::new(Mutex::new(app_data_internal));
 
         // egui_extrasの画像ローダーをインストール
         egui_extras::install_image_loaders(&_cc.egui_ctx);
 
-        // アプリケーション起動時に設定ファイルをチェック
+        // アプリケーション起動時にデータ移行と設定ファイルチェック
         let data_clone = data.clone();
         let runtime_handle = runtime.handle().clone();
 
         runtime_handle.spawn(async move {
+            // Run migration
+            let cache_db_clone = {
+                let app_data = data_clone.lock().unwrap();
+                app_data.cache_db.clone()
+            };
+            if let Err(e) = migrate_data_from_files(&cache_db_clone).await {
+                eprintln!("Data migration failed: {e}");
+            }
+
             let mut app_data = data_clone.lock().unwrap();
-            println!("Checking config file...");
+            // println!("Checking config file...");
 
             if Path::new(CONFIG_FILE).exists() {
-                println!("Existing user: Please enter your passphrase.");
+                // println!("Existing user: Please enter your passphrase.");
             } else {
-                println!("First-time setup: Enter your secret key and set a passphrase.");
+                // println!("First-time setup: Enter your secret key and set a passphrase.");
             }
             app_data.should_repaint = true;
         });
-        
+
         Self { data, runtime }
     }
 }
@@ -270,5 +259,3 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| Ok(Box::new(NostrStatusApp::new(cc)))),
     )
 }
-
-

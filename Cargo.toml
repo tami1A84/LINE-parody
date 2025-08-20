@@ -4,9 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-nostr = "0.30"
-nostr-sdk = "0.30"
-nostr-types = "0.4.0"
+regex = "1"
+heed = "0.20"
+nostr = { version = "0.43.0", features = ["nip47", "nip06"] }
+nostr-sdk = { version = "0.43.0", features = ["lmdb"] }
 tokio = { version = "1", features = ["full"] }
 chacha20poly1305 = "0.10"
 rand = "0.8"
@@ -25,6 +26,22 @@ epaint = "0.32.0"
 egui = "0.32.0"
 env_logger = "0.10"
 egui_extras = { version = "0.32.0", features = ["all_loaders", "http"] }
+ehttp = "0.5.0"
+image = { version = "0.25", features = ["png", "jpeg"] }
 resvg = "0.45"
 usvg = "0.45"
+fluent = "0.16"
+unic-langid = "0.9"
+intl-memoizer = "0.5"
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+futures-util = "0.3"
+async-tungstenite = { version = "0.26.0", features = ["tokio-runtime", "tokio-rustls-native-certs"] }
+anyhow = "1.0"
+bech32 = "0.9"
+urlencoding = "2.1.3"
+ureq = { version = "2.9.7", features = ["json"] }
+bip39 = "2.0"
+lightning-invoice = "0.33.2"
+
 

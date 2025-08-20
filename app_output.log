@@ -1,1 +1,6 @@
-   Compiling nostr-nip38-status-sender v0.1.0 (/app)
+   Compiling unicode-ident v1.0.18
+   Compiling cfg-if v1.0.1
+   Compiling libc v0.2.175
+   Compiling memchr v2.7.5
+   Compiling proc-macro2 v1.0.97
+   Compiling once_cell v1.21.3
